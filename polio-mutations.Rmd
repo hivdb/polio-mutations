@@ -1,0 +1,241 @@
+---
+title: "Polio Mutations"
+author: "Philip Tzou"
+date: "2023-08-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+if (!require("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+if (!require("Biostrings", quietly = TRUE))
+  BiocManager::install("Biostrings")
+if (!require("tibble", quietly = TRUE))
+  install.packages("tibble")
+if (!require("stringr", quietly = TRUE))
+  install.packages("stringr")
+if (!require("dplyr", quietly = TRUE))
+  install.packages("dplyr")
+if (!require("tidyr", quietly = TRUE))
+  install.packages("tidyr")
+if (!require("DT", quietly = TRUE))
+  install.packages("DT")
+
+library("DT")
+library("dplyr")
+library("stringr")
+```
+
+```{r read-fasta-files}
+
+readFastaDir = function(dirpath) {
+  results = c()
+  for (filename in list.files(dirpath)) {
+    lower = tolower(filename)
+    if (endsWith(lower, ".fa") || endsWith(lower, ".fas") || endsWith(lower, ".fasta")) {
+      results = append(results, Biostrings::readDNAStringSet(paste(dirpath, filename, sep = "/")))
+    }
+  }
+  results
+}
+refs = readFastaDir("refs")
+s1Seqs = readFastaDir("sequences/S1")
+s2Seqs = readFastaDir("sequences/S2")
+s3Seqs = readFastaDir("sequences/S3")
+```
+
+```{r perform-alignments}
+
+alignSequences = function(sequences, ref) {
+  tibble(
+    name = names(sequences),
+    alignment = as.list(Biostrings::pairwiseAlignment(sequences, ref))
+  )
+}
+
+s1Alignments = alignSequences(s1Seqs, refs['AY184219.1 Human poliovirus 1 strain Sabin 1, complete genome'])
+s2Alignments = alignSequences(s2Seqs, refs['AY184220.1 Human poliovirus 2 strain Sabin 2, complete genome'])
+s3Alignments = alignSequences(s3Seqs, refs['AY184221.1 Human poliovirus 3 strain Sabin 3, complete genome'])
+```
+
+```{r extract-mutations, message = FALSE}
+
+extractNAPairs = function(alignments) {
+  alignments %>% mutate(
+      ref = base::strsplit(sapply(
+        alignment, function(x) toString(Biostrings::subject(x))
+      ), ""),
+      target = base::strsplit(sapply(
+        alignment, function(x) toString(Biostrings::pattern(x))
+      ), ""),
+      pos = sapply(ref, function(ref) {
+        positions = c()
+        pos = 0
+        for (n in ref) {
+          if (n != '-') {
+            pos = pos + 1
+          }
+          positions = append(positions, pos)
+        }
+        list(positions)
+      })
+    ) %>%
+    select(-alignment) %>%
+    tidyr::unnest(c(ref, target, pos)) %>%
+    filter(target != 'N') %>%
+    group_by(name, pos) %>%
+    summarise(
+      ref = ref[1],
+      target = paste(target, collapse = '')
+    ) %>%
+    ungroup %>%
+    mutate(
+      isInsertion = str_length(target) > 1,
+      isDeletion = target == '-'
+    )
+}
+
+filterMutations = function(naPairs) {
+  naPairs %>% filter(ref != target)
+}
+
+s1NAPairs = extractNAPairs(s1Alignments)
+s2NAPairs = extractNAPairs(s2Alignments)
+s3NAPairs = extractNAPairs(s3Alignments)
+s1Mutations = filterMutations(s1NAPairs)
+s2Mutations = filterMutations(s2NAPairs)
+s3Mutations = filterMutations(s3NAPairs)
+```
+
+```{r sequence-summary, message=FALSE}
+summarizeSequences = function(naPairs) {
+  naPairs %>%
+    group_by(name) %>%
+    summarise(
+      firstNA = min(pos),
+      lastNA = max(pos),
+      nonNCoverage = length(pos),
+      numMuts = sum(ref != target),
+      pcntMuts = numMuts / nonNCoverage,
+      numInsertions = sum(isInsertion),
+      numDeletions = sum(isDeletion),
+      # mutations = paste(sprintf("%s%d%s", ref, pos, target)[ref != target & !isInsertion & !isDeletion], collapse=", "),
+      insertions = paste(sprintf("%s%d%s", ref, pos, target)[isInsertion], collapse=", "),
+      deletions = paste(sprintf("%s%d%s", ref, pos, target)[isDeletion], collapse=", ")
+    ) %>%
+    ungroup
+}
+
+s1Summary = summarizeSequences(s1NAPairs)
+s2Summary = summarizeSequences(s2NAPairs)
+s3Summary = summarizeSequences(s3NAPairs)
+```
+
+```{r position-summary, message=FALSE}
+summarizePositions = function(naPairs) {
+  naPairs %>%
+    group_by(pos, ref) %>%
+    summarise(
+      coverage = length(name),
+      A = sum(target == 'A'),
+      C = sum(target == 'C'),
+      G = sum(target == 'G'),
+      T = sum(target == 'T'),
+      ins = sum(isInsertion),
+      del = sum(isDeletion)
+    ) %>%
+    ungroup %>%
+    mutate(
+      nonRefPcnt = case_when(
+        ref == 'A' ~ C + G + T + ins + del,
+        ref == 'C' ~ A + G + T + ins + del,
+        ref == 'G' ~ A + C + T + ins + del,
+        ref == 'T' ~ A + C + G + ins + del
+      ) / coverage
+    )
+}
+
+s1PosSummary = summarizePositions(s1NAPairs)
+s2PosSummary = summarizePositions(s2NAPairs)
+s3PosSummary = summarizePositions(s3NAPairs)
+```
+
+## Results{.tabset}
+
+```{r define-styled-dt}
+styledDT <- function(data, caption = NULL, escape = FALSE, pageLength = 20, autoWidth = FALSE) {
+  DT::datatable(
+    data,
+    caption = caption,
+    escape = escape,
+    rownames = FALSE,
+    height = "auto",
+    extensions = 'Buttons',
+    options = list(
+        pageLength = pageLength,
+        dom = 'Bfrtip',
+        buttons = list('copy', 'csv', list(extend = 'excel', title = NULL), 'print'),
+        scrollX = TRUE,
+        autoWidth = autoWidth
+    )
+  )
+}
+```
+
+### S1
+
+#### Sequence summary
+```{r print-s1-summary}
+s1Summary %>% styledDT %>%
+  formatPercentage(c("pcntMuts"), 1)
+```
+
+#### Position summary
+```{r print-s1-position-summary}
+s1PosSummary %>% styledDT %>%
+  formatPercentage(c("nonRefPcnt"), 1)
+```
+
+#### Mutation List
+```{r print-s1-mutations}
+s1Mutations %>% styledDT
+```
+
+### S2
+
+#### Sequence summary
+```{r print-s2-summary}
+s2Summary %>% styledDT %>%
+  formatPercentage(c("pcntMuts"), 1)
+```
+
+#### Position summary
+```{r print-s2-position-summary}
+s2PosSummary %>% styledDT %>%
+  formatPercentage(c("nonRefPcnt"), 1)
+```
+
+#### Mutation List
+```{r print-s2-mutations}
+s2Mutations %>% styledDT
+```
+
+### S3
+
+#### Sequence summary
+```{r print-s3-summary}
+s3Summary %>% styledDT %>%
+  formatPercentage(c("pcntMuts"), 1)
+```
+
+#### Position summary
+```{r print-s3-position-summary}
+s3PosSummary %>% styledDT %>%
+  formatPercentage(c("nonRefPcnt"), 1)
+```
+
+#### Mutation List
+```{r print-s3-mutations}
+s3Mutations %>% styledDT
+```
