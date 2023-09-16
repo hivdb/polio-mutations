@@ -1,5 +1,5 @@
 ---
-title: "Polio Mutations"
+title: "Polio Mutations (Distance Corrected Serotypes)"
 author: "Philip Tzou"
 date: "2023-09-16"
 output: html_document
@@ -136,9 +136,6 @@ filterMutations = function(naPairs, stype, posStart, posEnd) {
 s1NAPairs = extractNAPairs(s1Alignments)
 s2NAPairs = extractNAPairs(s2Alignments)
 s3NAPairs = extractNAPairs(s3Alignments)
-s1Mutations = filterMutations(s1NAPairs, 'S1', 21, 3484)
-s2Mutations = filterMutations(s2NAPairs, 'S2', 21, 3483)
-s3Mutations = filterMutations(s3NAPairs, 'S3', 21, 3475)
 ```
 
 ## Distance analysis
@@ -198,7 +195,21 @@ s1Distance = calcDistance(s1NAPairs, 'S1')
 s2Distance = calcDistance(s2NAPairs, 'S2')
 s3Distance = calcDistance(s3NAPairs, 'S3')
 
-bind_rows(s1Distance, s2Distance, s3Distance) %>%
+allDistance = bind_rows(s1Distance, s2Distance, s3Distance)
+allNAPairs = bind_rows(s1NAPairs, s2NAPairs, s3NAPairs) %>%
+  inner_join(
+    select(allDistance, name, distanceCall),
+    by = join_by(name, serotype == distanceCall))
+
+s1NAPairs = filter(allNAPairs, serotype == 'S1')
+s2NAPairs = filter(allNAPairs, serotype == 'S2')
+s3NAPairs = filter(allNAPairs, serotype == 'S3')
+
+s1Mutations = filterMutations(s1NAPairs, 'S1', 21, 3484)
+s2Mutations = filterMutations(s2NAPairs, 'S2', 21, 3483)
+s3Mutations = filterMutations(s3NAPairs, 'S3', 21, 3475)
+
+allDistance %>%
   mutate(discordant = ifelse(primersCall == distanceCall, '', 'Yes')) %>%
   styledDT %>%
   formatPercentage(columns = c('S1', 'S2', 'S3'))
