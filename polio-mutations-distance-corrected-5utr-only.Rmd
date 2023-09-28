@@ -1,0 +1,403 @@
+---
+title: "Polio Mutations (Distance Corrected Serotypes) 5UTR only"
+author: "Philip Tzou"
+date: "2023-09-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+if (!require("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+if (!require("Biostrings", quietly = TRUE))
+  BiocManager::install("Biostrings")
+if (!require("tibble", quietly = TRUE))
+  install.packages("tibble")
+if (!require("stringr", quietly = TRUE))
+  install.packages("stringr")
+if (!require("dplyr", quietly = TRUE))
+  install.packages("dplyr")
+if (!require("tidyr", quietly = TRUE))
+  install.packages("tidyr")
+if (!require("DT", quietly = TRUE))
+  install.packages("DT")
+if (!require("ggplot2", quietly = TRUE))
+  install.packages("ggplot2")
+
+library("DT")
+library("dplyr")
+library("stringr")
+```
+
+```{r read-fasta-files}
+
+readFastaDir = function(dirpath) {
+  results = c()
+  for (filename in list.files(dirpath)) {
+    lower = tolower(filename)
+    if (endsWith(lower, ".fa") || endsWith(lower, ".fas") || endsWith(lower, ".fasta")) {
+      results = append(results, Biostrings::readDNAStringSet(paste(dirpath, filename, sep = "/")))
+    }
+  }
+  results
+}
+refs = readFastaDir("refs")
+s1Seqs = readFastaDir("sequences/S1")
+s2Seqs = readFastaDir("sequences/S2")
+s3Seqs = readFastaDir("sequences/S3")
+```
+
+```{r define-styled-dt}
+styledDT <- function(data, caption = NULL, escape = FALSE, pageLength = 20, autoWidth = FALSE) {
+  DT::datatable(
+    data,
+    caption = caption,
+    escape = escape,
+    rownames = FALSE,
+    height = "auto",
+    extensions = 'Buttons',
+    options = list(
+        pageLength = pageLength,
+        dom = 'Bfrtip',
+        buttons = list('copy', 'csv', list(extend = 'excel', title = NULL), 'print'),
+        scrollX = TRUE,
+        autoWidth = autoWidth
+    )
+  )
+}
+```
+
+```{r perform-alignments}
+
+alignSequences = function(sequences) {
+  tibble(
+    name = names(sequences),
+    serotype = 'S1',
+    alignment = as.list(Biostrings::pairwiseAlignment(sequences, refs['AY184219.1 Human poliovirus 1 strain Sabin 1, complete genome']))
+  ) %>%
+    bind_rows(tibble(
+      name = names(sequences),
+      serotype = 'S2',
+      alignment = as.list(Biostrings::pairwiseAlignment(sequences, refs['AY184220.1 Human poliovirus 2 strain Sabin 2, complete genome']))
+    )) %>%
+    bind_rows(tibble(
+      name = names(sequences),
+      serotype = 'S3',
+      alignment = as.list(Biostrings::pairwiseAlignment(sequences, refs['AY184221.1 Human poliovirus 3 strain Sabin 3, complete genome']))
+    ))
+}
+
+s1Alignments = alignSequences(s1Seqs)
+s2Alignments = alignSequences(s2Seqs)
+s3Alignments = alignSequences(s3Seqs)
+```
+
+```{r extract-mutations, message = FALSE}
+
+extractNAPairs = function(alignments) {
+  alignments %>% mutate(
+      ref = base::strsplit(sapply(
+        alignment, function(x) toString(Biostrings::subject(x))
+      ), ""),
+      target = base::strsplit(sapply(
+        alignment, function(x) toString(Biostrings::pattern(x))
+      ), ""),
+      pos = sapply(ref, function(ref) {
+        positions = c()
+        pos = 0
+        for (n in ref) {
+          if (n != '-') {
+            pos = pos + 1
+          }
+          positions = append(positions, pos)
+        }
+        list(positions)
+      })
+    ) %>%
+    select(-alignment) %>%
+    tidyr::unnest(c(ref, target, pos)) %>%
+    filter(target != 'N') %>%
+    group_by(name, serotype, pos) %>%
+    summarise(
+      ref = ref[1],
+      target = paste(target, collapse = '')
+    ) %>%
+    ungroup %>%
+    mutate(
+      isInsertion = str_length(target) > 1,
+      isDeletion = target == '-'
+    )
+}
+
+filterMutations = function(naPairs, stype, posStart, posEnd) {
+  naPairs %>% filter(ref != target & serotype == stype & pos >= posStart & pos <= posEnd)
+}
+
+s1NAPairs = extractNAPairs(s1Alignments) %>% filter(pos < 1001)
+s2NAPairs = extractNAPairs(s2Alignments) %>% filter(pos < 1001)
+s3NAPairs = extractNAPairs(s3Alignments) %>% filter(pos < 1001)
+```
+
+## Distance analysis
+
+```{r calc-distance, message=FALSE}
+refTable = tibble(
+  refName=names(refs),
+  sequence=as.character(refs)
+) %>%
+  mutate(
+    serotype = case_when(
+      startsWith(refName, 'AY184219') ~ 'S1',
+      startsWith(refName, 'AY184220') ~ 'S2',
+      startsWith(refName, 'AY184221') ~ 'S3'
+    ),
+    nuc = base::strsplit(sequence, ""),
+    pos = sapply(nuc, function(nuc) {
+      positions = c()
+      pos = 0
+      for (n in nuc) {
+        if (n != '-') {
+          pos = pos + 1
+        }
+        positions = append(positions, pos)
+      }
+      list(positions)
+    })
+  ) %>%
+  select(-sequence) %>%
+  tidyr::unnest(c(pos, nuc))
+
+calcDistance = function(naPairs, origSType) {
+  naPairs %>%
+  filter(target != 'N') %>%
+  inner_join(refTable, by = c('serotype', 'pos'), relationship = 'many-to-many') %>%
+  group_by(name, serotype) %>%
+  summarise(
+    total = length(pos),
+    diff = sum(nuc != target)
+  ) %>%
+  ungroup %>%
+  mutate(distance = diff / total) %>%
+  select(name, serotype, distance) %>%
+  tidyr::pivot_wider(values_from = distance, names_from = serotype) %>%
+  mutate(
+    primersCall = origSType,
+    distanceCall = case_when(
+      S1 < S2 & S1 < S3 ~ 'S1',
+      S2 < S1 & S2 < S3 ~ 'S2',
+      S3 < S1 & S3 < S2 ~ 'S3',
+      TRUE ~ 'U'
+    )
+  )
+}
+
+s1Distance = calcDistance(s1NAPairs, 'S1')
+s2Distance = calcDistance(s2NAPairs, 'S2')
+s3Distance = calcDistance(s3NAPairs, 'S3')
+
+allDistance = bind_rows(s1Distance, s2Distance, s3Distance)
+allNAPairs = bind_rows(s1NAPairs, s2NAPairs, s3NAPairs) %>%
+  inner_join(
+    select(allDistance, name, distanceCall),
+    by = join_by(name, serotype == distanceCall))
+
+s1NAPairs = filter(allNAPairs, serotype == 'S1')
+s2NAPairs = filter(allNAPairs, serotype == 'S2')
+s3NAPairs = filter(allNAPairs, serotype == 'S3')
+
+s1Mutations = filterMutations(s1NAPairs, 'S1', 21, 3484)
+s2Mutations = filterMutations(s2NAPairs, 'S2', 21, 3483)
+s3Mutations = filterMutations(s3NAPairs, 'S3', 21, 3475)
+
+allDistance %>%
+  mutate(discordant = ifelse(primersCall == distanceCall, '', 'Yes')) %>%
+  styledDT %>%
+  formatPercentage(columns = c('S1', 'S2', 'S3'))
+```
+
+```{r sequence-summary, message=FALSE}
+summarizeSequences = function(naPairs, stype, posStart, posEnd) {
+  naPairs %>%
+    filter(serotype == stype & pos >= posStart & pos <= posEnd) %>%
+    group_by(name) %>%
+    summarise(
+      firstNA = min(pos),
+      lastNA = max(pos),
+      nonNCoverage = length(pos),
+      numMuts = sum(ref != target),
+      pcntMuts = numMuts / nonNCoverage,
+      numInsertions = sum(isInsertion),
+      numDeletions = sum(isDeletion),
+      # mutations = paste(sprintf("%s%d%s", ref, pos, target)[ref != target & !isInsertion & !isDeletion], collapse=", "),
+      insertions = paste(sprintf("%s%d%s", ref, pos, target)[isInsertion], collapse=", "),
+      deletions = paste(sprintf("%s%d%s", ref, pos, target)[isDeletion], collapse=", ")
+    ) %>%
+    ungroup
+}
+
+s1Summary = summarizeSequences(s1NAPairs, 'S1', 21, 3484)
+s2Summary = summarizeSequences(s2NAPairs, 'S2', 21, 3483)
+s3Summary = summarizeSequences(s3NAPairs, 'S3', 21, 3475)
+```
+
+```{r seq-position-summary, message=FALSE}
+summarizeSeqPositions = function(naPairs, stype, posStart, posEnd) {
+  naPairs %>%
+    filter(serotype == stype & pos >= posStart & pos <= posEnd) %>%
+    group_by(name, pos, ref) %>%
+    summarise(
+      coverage = length(name),
+      A = sum(target == 'A'),
+      C = sum(target == 'C'),
+      G = sum(target == 'G'),
+      T = sum(target == 'T'),
+      ins = sum(isInsertion),
+      del = sum(isDeletion)
+    ) %>%
+    ungroup %>%
+    mutate(
+      nonRefPcnt = case_when(
+        ref == 'A' ~ C + G + T + ins + del,
+        ref == 'C' ~ A + G + T + ins + del,
+        ref == 'G' ~ A + C + T + ins + del,
+        ref == 'T' ~ A + C + G + ins + del
+      ) / coverage
+    )
+}
+
+plotSeqPosSummary = function(seqPosSummary) {
+  seqPosSummary %>%
+    mutate(name = str_replace(name, "_L001 AY1842\\d\\d.1$", "")) %>%
+    ggplot2::ggplot() +
+    ggplot2::geom_tile(aes(x = pos, y = name, fill = nonRefPcnt)) +
+    ggplot2::scale_fill_gradient(low = "#f8f8f8", high = "darkred") +
+    ggplot2::scale_x_continuous(expand = c(0, 0), breaks = seq(1, 5000, 50)) +
+    ggplot2::theme(
+      panel.grid=element_blank(),
+      panel.border=element_blank(),
+      panel.background=element_rect(fill = '#f8f8f8')
+    )
+}
+
+s1SeqPosSummary = summarizeSeqPositions(s1NAPairs, 'S1', 21, 3484)
+s2SeqPosSummary = summarizeSeqPositions(s2NAPairs, 'S2', 21, 3483)
+s3SeqPosSummary = summarizeSeqPositions(s3NAPairs, 'S3', 21, 3475)
+```
+
+```{r position-summary, message=FALSE}
+summarizePositions = function(naPairs, stype, posStart, posEnd) {
+  naPairs %>%
+    filter(serotype == stype & pos >= posStart & pos <= posEnd) %>%
+    group_by(pos, ref) %>%
+    summarise(
+      coverage = length(name),
+      A = sum(target == 'A'),
+      C = sum(target == 'C'),
+      G = sum(target == 'G'),
+      T = sum(target == 'T'),
+      ins = sum(isInsertion),
+      del = sum(isDeletion)
+    ) %>%
+    ungroup %>%
+    mutate(
+      nonRefPcnt = case_when(
+        ref == 'A' ~ C + G + T + ins + del,
+        ref == 'C' ~ A + G + T + ins + del,
+        ref == 'G' ~ A + C + T + ins + del,
+        ref == 'T' ~ A + C + G + ins + del
+      ) / coverage
+    )
+}
+
+s1PosSummary = summarizePositions(s1NAPairs, 'S1', 21, 3484)
+s2PosSummary = summarizePositions(s2NAPairs, 'S2', 21, 3483)
+s3PosSummary = summarizePositions(s3NAPairs, 'S3', 21, 3475)
+```
+
+<style>
+.full-width-image {
+  width: 100%;
+  overflow-x: scroll;
+}
+
+.full-width-image img {
+  max-width: max-content;
+}
+</style>
+
+## Results{.tabset}
+
+### S1
+
+#### Sequence summary
+```{r print-s1-summary}
+s1Summary %>% styledDT %>%
+  formatPercentage(c("pcntMuts"), 1)
+```
+
+#### Position summary
+```{r print-s1-position-summary}
+s1PosSummary %>% styledDT %>%
+  formatPercentage(c("nonRefPcnt"), 1)
+```
+
+<div class="full-width-image">
+```{r plot-s1-position-summary, fig.width = 64, fig.height = 8}
+plotSeqPosSummary(s1SeqPosSummary)
+```
+</div>
+
+#### Mutation List
+```{r print-s1-mutations}
+s1Mutations %>% styledDT
+```
+
+### S2
+
+#### Sequence summary
+```{r print-s2-summary}
+s2Summary %>% styledDT %>%
+  formatPercentage(c("pcntMuts"), 1)
+```
+
+#### Position summary
+```{r print-s2-position-summary}
+s2PosSummary %>% styledDT %>%
+  formatPercentage(c("nonRefPcnt"), 1)
+```
+
+<div class="full-width-image">
+```{r plot-s2-position-summary, fig.width = 64, fig.height = 8}
+plotSeqPosSummary(s2SeqPosSummary)
+```
+</div>
+
+#### Mutation List
+```{r print-s2-mutations}
+s2Mutations %>% styledDT
+```
+
+### S3
+
+#### Sequence summary
+```{r print-s3-summary}
+s3Summary %>% styledDT %>%
+  formatPercentage(c("pcntMuts"), 1)
+```
+
+#### Position summary
+```{r print-s3-position-summary}
+s3PosSummary %>% styledDT %>%
+  formatPercentage(c("nonRefPcnt"), 1)
+```
+
+<div class="full-width-image">
+```{r plot-s3-position-summary, fig.width = 64, fig.height = 8}
+plotSeqPosSummary(s3SeqPosSummary)
+```
+
+</div>
+#### Mutation List
+```{r print-s3-mutations}
+s3Mutations %>% styledDT
+```
